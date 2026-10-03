@@ -6,9 +6,15 @@
 
 控制链固定为「信号 → 停稳对位 → 开门 → 间隙探测 → 关门 → 发车 → 审计」，
 任何一步错位都会被对应组件拒绝，并把拒绝原因落进审计。
+
+改图走修订流程：提议落盘 → 第二人确认 → 等安全作业间隙生效，生效前可撤回。
+「对位 → 开门」与「换图生效」共用同一把互斥锁，保证一列车不会按换到一半的
+映射开门；生效指针本身是原子替换，门控读到的永远是完整的新或旧版本。
 """
 
 from __future__ import annotations
+
+import threading
 
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
@@ -16,10 +22,13 @@ from .config import PlatformConfig, default_config, with_storage_root
 from .door import (
     DoorController,
     active_group,
+    active_group_revision,
+    active_key,
     batch_open,
     close_and_audit,
     depart,
     depart_policy,
+    departed,
     door_report,
     door_state,
     enqueue,
@@ -29,7 +38,7 @@ from .door import (
     process_queue,
     queued_total,
 )
-from .errors import RailError
+from .errors import MappingError, RailError
 from .eventbus import Event, EventBus
 from .gap import GapRegistry, gap_summary
 from .ids import IdFactory
@@ -44,6 +53,7 @@ from .interlock import (
 )
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
+from .platform.revision import APPROVED
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
 from .quota import QuotaRegistry
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
@@ -125,7 +135,7 @@ class Platform:
         self.signals = SignalController(store)
         self.faults = FaultRegistry(store)
         self.armers = InterlockArmer(store)
-        self.mappings = MappingRegistry(store)
+        self.mappings = MappingRegistry(store, clock=self.clock, layout_probe=self._layout_probe)
         self.gaps = GapRegistry(store)
         self.quotas = QuotaRegistry(store)
         self.commands = CommandLog(store)
@@ -136,6 +146,7 @@ class Platform:
 
         self._cycles = 0
         self._operations = 0
+        self._mapping_lock = threading.RLock()
         self._event_counts: dict[str, int] = {}
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
@@ -189,7 +200,7 @@ class Platform:
                 for index, group in enumerate(groups, start=1)
             ]
             self.layouts.save(Layout(station_id=station_id, zones=zones))
-            self.mappings.renumber(station_id, {group: group for group in groups})
+            self.mappings.install(station_id, {group: group for group in groups})
             self.schedules.save(
                 Schedule(station_id=station_id, headways=[120, 150, 180, 240])
             )
@@ -213,13 +224,21 @@ class Platform:
         )
 
     def _restore(self) -> None:
-        """从落盘状态恢复操作计数与锁定状态。"""
+        """从落盘状态恢复操作计数、锁定状态与映射生效现场。"""
 
         state = self.store.read("platform/state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        for repair in self.mappings.recover():
+            self.audit.record(
+                "mapping_activation_repaired",
+                "",
+                str(repair.get("station_id", "")),
+                revision=repair.get("revision", 0),
+                action=repair.get("action", ""),
+            )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -393,21 +412,23 @@ class Platform:
         self.trains.assign_station(train_id, station_id)
 
         stop_position = self._stop_position(station_id)
-        try:
-            alignment = self.align.align(train_id, position_m, stop_position, self.clock.now())
-        except RailError as error:
-            return reject(error.message)
-        steps.append(
-            {
-                "component": "train",
-                "action": "align",
-                "detail": {"train_id": train_id, "position_m": alignment.position_m},
-            }
-        )
-        try:
-            self.doors_open(train_id, station_id)
-        except RailError as error:
-            return reject(error.message)
+        # 「对位 → 开门」与「换图生效」互斥：一列车不会按换到一半的映射开门。
+        with self._mapping_lock:
+            try:
+                alignment = self.align.align(train_id, position_m, stop_position, self.clock.now())
+            except RailError as error:
+                return reject(error.message)
+            steps.append(
+                {
+                    "component": "train",
+                    "action": "align",
+                    "detail": {"train_id": train_id, "position_m": alignment.position_m},
+                }
+            )
+            try:
+                self.doors_open(train_id, station_id)
+            except RailError as error:
+                return reject(error.message)
         entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
         report = {
             "ok": True,
@@ -423,13 +444,24 @@ class Platform:
         return {**report, **summary, "arrival_audit": entry.id}
 
     def doors_open(self, train_id: str, station_id: str) -> dict:
-        """开门并确认车门：对位必须先落盘。"""
+        """开门并确认车门：对位必须先落盘；联动记录所用映射修订。"""
 
         report = open_doors(self.doors, train_id, self.clock.now())
         group = self._primary_group(station_id)
-        if group:
-            open_group(self.doors, self.mappings, station_id, group)
+        linked: dict = {}
+        with self._mapping_lock:
+            if group:
+                linked = open_group(self.doors, self.mappings, station_id, group)
         self.train_doors.confirm_open(train_id, self.clock.now())
+        revision = int(linked.get("revision", 0)) if linked else 0
+        self.audit.record(
+            "door_group",
+            train_id,
+            station_id,
+            group=group,
+            revision=revision,
+            replayed=bool(linked.get("replayed", False)) if linked else False,
+        )
         self.bus.publish(
             Event.of(
                 "door",
@@ -439,9 +471,10 @@ class Platform:
                 station_id=station_id,
                 severity="notice",
                 group=group,
+                revision=revision,
             )
         )
-        return {**report, "group": group}
+        return {**report, "group": group, "revision": revision}
 
     def depart(self, train_id: str, station_id: str) -> dict:
         """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
@@ -532,21 +565,256 @@ class Platform:
         self.audit.record("gap_probe", train_id, "", clear=clear)
         return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
 
-    def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
-        """按最新布局重排门区映射，并按新映射联动一次。"""
+    # ---- 门区映射修订流程 -----------------------------------------------
 
-        mapping = self.mappings.renumber(station_id, groups)
-        first_key = sorted(groups)[0]
-        linked = open_group(self.doors, self.mappings, station_id, first_key)
-        self.audit.record("mapping_renumber", "", station_id, revision=mapping.revision)
+    def propose_mapping(
+        self,
+        station_id: str,
+        groups: dict[str, str],
+        actor: str,
+        not_before: float = 0.0,
+    ) -> dict:
+        """提议一次改图：内容落盘为不可变修订，等待第二人确认。"""
+
+        revision = self.mappings.propose(station_id, groups, actor, not_before=not_before)
+        self.audit.record(
+            "mapping_proposed",
+            "",
+            station_id,
+            revision=revision.revision,
+            actor=actor,
+            base_revision=revision.base_revision,
+            layout_revision=revision.layout_revision,
+        )
         return {
             "ok": True,
             "station_id": station_id,
-            "revision": mapping.revision,
-            "mapping": mapping.as_dict(),
-            "active_group": linked["group"],
+            "revision": revision.revision,
+            "state": revision.state,
+            "base_revision": revision.base_revision,
+            "active_revision": self.mappings.revision(station_id),
+            "pending": True,
             "violations": [],
         }
+
+    def confirm_mapping(self, station_id: str, revision: int, actor: str) -> dict:
+        """第二人确认改图；确认后等下一个安全作业间隙生效。"""
+
+        confirmed = self.mappings.confirm(station_id, revision, actor)
+        self.audit.record(
+            "mapping_confirmed",
+            "",
+            station_id,
+            revision=confirmed.revision,
+            actor=actor,
+            proposer=confirmed.proposer,
+        )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "revision": confirmed.revision,
+            "state": confirmed.state,
+            "proposer": confirmed.proposer,
+            "confirmer": confirmed.confirmer,
+            "active_revision": self.mappings.revision(station_id),
+            "violations": [],
+        }
+
+    def withdraw_mapping(self, station_id: str, revision: int, actor: str) -> dict:
+        """生效前撤回修订；旧版本继续可用，门控完全无感。"""
+
+        withdrawn = self.mappings.withdraw(station_id, revision, actor)
+        self.audit.record(
+            "mapping_withdrawn",
+            "",
+            station_id,
+            revision=withdrawn.revision,
+            actor=actor,
+            proposer=withdrawn.proposer,
+        )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "revision": withdrawn.revision,
+            "state": withdrawn.state,
+            "active_revision": self.mappings.revision(station_id),
+            "violations": [],
+        }
+
+    def rollback_mapping(self, station_id: str, target_revision: int, actor: str) -> dict:
+        """以历史修订的内容发起回滚提议（同样要确认、同样等安全间隙）。"""
+
+        revision = self.mappings.propose_rollback(station_id, target_revision, actor)
+        self.audit.record(
+            "mapping_rollback_proposed",
+            "",
+            station_id,
+            revision=revision.revision,
+            target_revision=target_revision,
+            actor=actor,
+        )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "revision": revision.revision,
+            "target_revision": target_revision,
+            "state": revision.state,
+            "active_revision": self.mappings.revision(station_id),
+            "violations": [],
+        }
+
+    def activate_mapping(self, station_id: str, actor: str = "manual") -> dict:
+        """手动触发生效：仍要过生效时刻与安全作业间隙两道闸。"""
+
+        pending = self.mappings.pending(station_id)
+        if pending is None:
+            return {"ok": False, "station_id": station_id, "violations": ["没有待生效的修订"]}
+        if pending.state != APPROVED:
+            return {
+                "ok": False,
+                "station_id": station_id,
+                "revision": pending.revision,
+                "violations": [f"修订 {pending.revision} 当前状态为 {pending.state}，不能生效"],
+            }
+        now = self.clock.now()
+        if pending.not_before > now:
+            return {
+                "ok": False,
+                "station_id": station_id,
+                "revision": pending.revision,
+                "violations": [f"未到生效时刻（not_before={pending.not_before:.0f}）"],
+            }
+        with self._mapping_lock:
+            window = self.mapping_window(station_id)
+            if not window["safe"]:
+                return {
+                    "ok": False,
+                    "station_id": station_id,
+                    "revision": pending.revision,
+                    "violations": list(window["reasons"]),
+                    "window": window,
+                }
+            activated, previous = self.mappings.activate(station_id)
+        self.audit.record(
+            "mapping_activated",
+            "",
+            station_id,
+            revision=activated.revision,
+            previous_revision=previous.revision,
+            activation_id=activated.activation_id,
+            actor=actor,
+        )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "revision": activated.revision,
+            "previous_revision": previous.revision,
+            "active_revision": self.mappings.revision(station_id),
+            "violations": [],
+        }
+
+    def mapping_window(self, station_id: str) -> dict:
+        """评估站台当前是否处于可安全换图的作业间隙。"""
+
+        trains_here = [train.id for train in self.trains.list() if train.station == station_id]
+        occupied = [
+            train_id
+            for train_id in trains_here
+            if self.align.durable(train_id) and not departed(self.doors, train_id)
+        ]
+        gates = self.gates.by_station(station_id)
+        open_gates = [gate.id for gate in gates if gate.open]
+        locked_gates = [gate.id for gate in gates if self.lockouts.is_locked(gate.id)]
+        queued = {
+            train_id: self.commands.ids(train_id)
+            for train_id in trains_here
+            if self.commands.ids(train_id)
+        }
+        blocked = [train_id for train_id in trains_here if self.gaps.state(train_id) == "blocked"]
+        reasons: list[str] = []
+        if occupied:
+            reasons.append("站台有列车对位未发车")
+        if open_gates:
+            reasons.append("站台门未全部关闭")
+        if locked_gates:
+            reasons.append("站台门处于联锁锁定")
+        if queued:
+            reasons.append("有未执行的门控指令")
+        if blocked:
+            reasons.append("间隙探测可疑")
+        return {
+            "station_id": station_id,
+            "safe": not reasons,
+            "reasons": reasons,
+            "occupied": occupied,
+            "open_gates": open_gates,
+            "locked_gates": locked_gates,
+            "queued_commands": queued,
+            "gap_blocked": blocked,
+        }
+
+    def mapping_revisions(self, station_id: str) -> dict:
+        """返回某站台的修订流程全景：生效指针、在途修订与历史。"""
+
+        pending = self.mappings.pending(station_id)
+        return {
+            "station_id": station_id,
+            "active_revision": self.mappings.revision(station_id),
+            "pending": pending.as_dict() if pending else None,
+            "revisions": [revision.as_dict() for revision in self.mappings.revisions(station_id)],
+            "window": self.mapping_window(station_id),
+        }
+
+    def _activate_due_mappings(self, moment: float) -> tuple[list[dict], list[dict]]:
+        """在控制周期里为到期的已确认修订寻找安全作业间隙并生效。"""
+
+        activated: list[dict] = []
+        deferred: list[dict] = []
+        for station_id in self.namespace.station_ids():
+            if not self.mappings.activation_due(station_id, moment):
+                continue
+            pending = self.mappings.pending(station_id)
+            with self._mapping_lock:
+                window = self.mapping_window(station_id)
+                if not window["safe"]:
+                    deferred.append(
+                        {
+                            "station_id": station_id,
+                            "revision": pending.revision if pending else 0,
+                            "reasons": list(window["reasons"]),
+                        }
+                    )
+                    continue
+                try:
+                    revision, previous = self.mappings.activate(station_id)
+                except MappingError as error:
+                    # 并发安全网拦下的生效（如基准失效）不拖垮整个控制周期。
+                    deferred.append(
+                        {
+                            "station_id": station_id,
+                            "revision": pending.revision if pending else 0,
+                            "reasons": [error.message],
+                        }
+                    )
+                    continue
+            self.audit.record(
+                "mapping_activated",
+                "",
+                station_id,
+                revision=revision.revision,
+                previous_revision=previous.revision,
+                activation_id=revision.activation_id,
+                actor="cycle",
+            )
+            activated.append(
+                {
+                    "station_id": station_id,
+                    "revision": revision.revision,
+                    "previous_revision": previous.revision,
+                }
+            )
+        return activated, deferred
+
 
     def enqueue(self, train_id: str, command_id: str, kind: str, station_id: str = "") -> dict:
         """把一条门控指令排进队列。"""
@@ -648,9 +916,11 @@ class Platform:
         }
 
     def sweep(self, station_id: str) -> dict:
-        """整站清扫。"""
+        """整站清扫：关门后清掉联动记录，下一次开门按当时生效的映射重新解析。"""
 
-        return sweep_station(self.gates, station_id)
+        report = sweep_station(self.gates, station_id)
+        self.store.remove(active_key(station_id))
+        return report
 
     def register_dwell(self, train_id: str, seconds: float, station_id: str = "") -> dict:
         """登记停站时长。"""
@@ -684,6 +954,7 @@ class Platform:
             for train in self.trains.list()
             if not self.armers.armed(train.id) and depart_policy(self.doors, train.id)["allowed"]
         ]
+        mapping_activated, mapping_deferred = self._activate_due_mappings(moment)
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
@@ -697,6 +968,8 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "mapping_activated": mapping_activated,
+            "mapping_deferred": mapping_deferred,
             "violations": [],
         }
 
@@ -769,6 +1042,11 @@ class Platform:
                 station_id: {
                     "latest": self.mappings.history(station_id).latest(),
                     "log": self.mappings.history(station_id).as_dict()["revisions"],
+                    "pending": (
+                        self.mappings.pending(station_id).revision
+                        if self.mappings.pending(station_id)
+                        else 0
+                    ),
                 }
                 for station_id in self.namespace.station_ids()
             },
@@ -792,6 +1070,7 @@ class Platform:
 
         layout = self.layouts.get(station_id)
         mapping = self.mappings.current(station_id)
+        pending = self.mappings.pending(station_id)
         zones = list(layout.zones) if layout else []
         schedule = self.schedules.get(station_id)
         return {
@@ -805,8 +1084,11 @@ class Platform:
             "span_m": spread_m(zones),
             "minimum_headway_s": self.schedules.minimum_headway(station_id) if schedule else 0,
             "revision": mapping.revision if mapping else 0,
+            "pending_revision": pending.revision if pending else 0,
+            "pending_state": pending.state if pending else "",
             "groups": group_keys(self.mappings, station_id),
             "active_group": active_group(self.doors, station_id),
+            "active_group_revision": active_group_revision(self.doors, station_id),
             "pressure": open_pressure(self.doors, station_id),
         }
 
@@ -842,6 +1124,14 @@ class Platform:
         return self.store.remove("platform/state")
 
     # ---- 内部 ---------------------------------------------------------
+
+    def _layout_probe(self, station_id: str) -> tuple[int, list[str]] | None:
+        """给映射注册表提供布局探针：返回布局修订号与物理门区标识。"""
+
+        layout = self.layouts.get(station_id)
+        if layout is None:
+            return None
+        return layout.revision, [zone.id for zone in layout.zones]
 
     def _stop_position(self, station_id: str) -> int:
         """返回站台的停稳位置（取最近门区里程）。"""

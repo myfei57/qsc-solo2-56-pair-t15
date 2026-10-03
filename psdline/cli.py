@@ -79,13 +79,17 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     fault = platform.set_fault(_first_gate(platform, args.station))
     cleared = platform.clear_fault(_first_gate(platform, args.station))
     batched = platform.batch_open(args.station)
-    renumber = platform.renumber(args.station, _mirror_mapping(platform, args.station))
+    proposed = platform.propose_mapping(
+        args.station, _mirror_mapping(platform, args.station), actor="planner"
+    )
+    confirmed = platform.confirm_mapping(args.station, proposed["revision"], actor="reviewer")
     sequence = platform.sequence_verdict(65534, 4)
     dwell = platform.register_dwell(args.train, 45.0, args.station)
     route = platform.assign_route(args.train, args.station, _next_station(platform, args.station), 1200)
     departure = platform.depart(args.train, args.station)
-    cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
+    cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
+    mapping_activations = [item for result in cycles for item in result["mapping_activated"]]
 
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
@@ -103,7 +107,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "processed": processed,
         "swept": swept,
         "batch": {key: batched[key] for key in ("ok", "order", "opened", "nearest")},
-        "renumber": {key: renumber[key] for key in ("ok", "revision", "active_group")},
+        "mapping": {
+            "proposed_revision": proposed["revision"],
+            "confirmed_state": confirmed["state"],
+            "activations": mapping_activations,
+        },
         "fault": fault,
         "cleared": cleared,
         "sequence": sequence,
@@ -122,13 +130,16 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     for name, operation in (
         ("arrival", arrival),
         ("processed", processed),
-        ("renumber", renumber),
+        ("proposed", proposed),
+        ("confirmed", confirmed),
         ("cleared", cleared),
         ("sequence", sequence),
         ("departure", departure),
     ):
         if not operation.get("ok"):
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))
+    if not mapping_activations:
+        failures.append("mapping:修订未在作业间隙生效")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

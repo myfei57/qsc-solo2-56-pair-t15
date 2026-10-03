@@ -46,13 +46,24 @@ def test_depart_blocked_by_blocked_gap(platform):
     assert "间隙探测未确认" in departure["violations"]
 
 
-def test_renumber_links_new_group(platform):
-    result = platform.renumber("ST1", {"A": "G02", "B": "G03"})
-    assert result["ok"] is True
-    assert result["revision"] == 2
-    assert result["active_group"] == "G02"
+def test_mapping_change_defers_until_safe_gap(platform):
+    proposed = platform.propose_mapping("ST1", {"A": "G02", "B": "G03"}, actor="planner")
+    assert proposed["ok"] is True
+    assert proposed["revision"] == 2
+    assert platform.mappings.revision("ST1") == 1
+    confirmed = platform.confirm_mapping("ST1", 2, actor="reviewer")
+    assert confirmed["state"] == "approved"
+    assert platform.mappings.revision("ST1") == 1
+    platform.arrive("T01", "ST1", 0)
+    platform.cycle()
+    assert platform.mappings.revision("ST1") == 1
+    platform.check_gap("T01")
+    platform.depart("T01", "ST1")
+    platform.sweep("ST1")
+    platform.cycle()
     assert platform.mappings.revision("ST1") == 2
-    assert platform.station_view("ST1")["active_group"] == "G02"
+    assert platform.mappings.resolve("ST1", "A") == "G02"
+    assert platform.station_view("ST1")["pending_revision"] == 0
 
 
 def test_fault_locks_gate_and_clear_releases(platform):

@@ -72,6 +72,7 @@ class Api:
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
         add("GET", "/api/mapping/{stationID}", self._mapping)
+        add("GET", "/api/mapping/{stationID}/revisions", self._mapping_revisions)
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/arrive", self._arrive)
@@ -80,6 +81,10 @@ class Api:
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
         add("POST", "/api/renumber", self._renumber)
+        add("POST", "/api/mapping/confirm", self._mapping_confirm)
+        add("POST", "/api/mapping/withdraw", self._mapping_withdraw)
+        add("POST", "/api/mapping/activate", self._mapping_activate)
+        add("POST", "/api/mapping/rollback", self._mapping_rollback)
         add("POST", "/api/batch-open", self._batch_open)
         add("POST", "/api/fault", self._fault)
         add("POST", "/api/clear-fault", self._clear_fault)
@@ -170,6 +175,9 @@ class Api:
             raise RailError(f"站台 {station_id} 没有门区映射", component="console")
         return mapping.as_dict()
 
+    def _mapping_revisions(self, params: dict, body: dict) -> dict:
+        return self._platform.mapping_revisions(str(params.get("stationID", "")))
+
     def _resolve(self, params: dict, body: dict) -> dict:
         return self._platform.resolve_group(
             str(params.get("station_id", "")), str(params.get("group_key", ""))
@@ -215,8 +223,37 @@ class Api:
         groups = body.get("groups")
         if not isinstance(groups, dict) or not groups:
             raise RailError("映射必须是非空对象", component="console")
-        return self._platform.renumber(
-            _require(body, "station_id"), {str(k): str(v) for k, v in groups.items()}
+        return self._platform.propose_mapping(
+            _require(body, "station_id"),
+            {str(k): str(v) for k, v in groups.items()},
+            _require(body, "actor"),
+            not_before=_as_float(body, "not_before", 0.0),
+        )
+
+    def _mapping_confirm(self, params: dict, body: dict) -> dict:
+        return self._platform.confirm_mapping(
+            _require(body, "station_id"),
+            _as_int(body, "revision", 0),
+            _require(body, "actor"),
+        )
+
+    def _mapping_withdraw(self, params: dict, body: dict) -> dict:
+        return self._platform.withdraw_mapping(
+            _require(body, "station_id"),
+            _as_int(body, "revision", 0),
+            _require(body, "actor"),
+        )
+
+    def _mapping_activate(self, params: dict, body: dict) -> dict:
+        return self._platform.activate_mapping(
+            _require(body, "station_id"), str(body.get("actor", "console"))
+        )
+
+    def _mapping_rollback(self, params: dict, body: dict) -> dict:
+        return self._platform.rollback_mapping(
+            _require(body, "station_id"),
+            _as_int(body, "target_revision", 0),
+            _require(body, "actor"),
         )
 
     def _batch_open(self, params: dict, body: dict) -> dict:

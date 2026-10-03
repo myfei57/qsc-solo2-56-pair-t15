@@ -11,7 +11,7 @@ from .batch import batch_open
 from .close import CloseRecord
 from .close import close_and_audit, close_doors, close_durable
 from .door import DoorController
-from .group import active_group, open_group
+from .group import active_group, active_group_revision, active_key, open_group
 from .limit import open_pressure
 from .open import open_doors, opened
 from .policy import depart_policy
@@ -23,6 +23,8 @@ __all__ = [
     "CloseRecord",
     "DoorController",
     "active_group",
+    "active_key",
+    "active_group_revision",
     "batch_open",
     "close_and_audit",
     "close_doors",

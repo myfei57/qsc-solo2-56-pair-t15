@@ -97,7 +97,12 @@ def test_api_rejects_missing_and_bad_fields(platform):
     status, payload = api.handle(
         "POST", "/api/renumber", {}, {"station_id": "ST1", "groups": {"A": "G01"}}
     )
+    assert status == 400
+    status, payload = api.handle(
+        "POST", "/api/renumber", {}, {"station_id": "ST1", "groups": {"A": "G01"}, "actor": "planner"}
+    )
     assert status == 200
+    assert payload["pending"] is True
 
 
 def test_api_readiness_and_queries(platform):
@@ -108,7 +113,9 @@ def test_api_readiness_and_queries(platform):
     status, audit = api.handle("GET", "/api/audit", {"limit": "10"}, {})
     assert status == 200 and audit["entries"]
     status, timeline = api.handle("GET", "/api/timeline", {"train_id": "T01"}, {})
-    assert status == 200 and timeline["timeline"][0]["kind"] == "arrival"
+    assert status == 200
+    kinds = [item["kind"] for item in timeline["timeline"]]
+    assert "arrival" in kinds and "door_group" in kinds
     status, store = api.handle("GET", "/api/store", {}, {})
     assert status == 200 and "quota/arrival" in store["documents"]
     status, namespace = api.handle("GET", "/api/namespace", {}, {})
