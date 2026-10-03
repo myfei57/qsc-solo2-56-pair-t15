@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
@@ -20,6 +22,7 @@ from .door import (
     close_and_audit,
     depart,
     depart_policy,
+    departed,
     door_report,
     door_state,
     enqueue,
@@ -29,9 +32,9 @@ from .door import (
     process_queue,
     queued_total,
 )
-from .errors import RailError
+from .errors import MappingError, RailError
 from .eventbus import Event, EventBus
-from .gap import GapRegistry, gap_summary
+from .gap import GapRegistry, WorkGapRegistry, gap_summary
 from .ids import IdFactory
 from .interlock import (
     FaultRegistry,
@@ -58,7 +61,7 @@ from .station import (
     nearest_zone,
     spread_m,
 )
-from .store import CommandLog, JsonStore, JsonlJournal, StoreMetrics
+from .store import CommandLog, FileLock, JsonStore, JsonlJournal, StoreMetrics
 from .telemetry import TrendBuffer
 from .train import (
     AlignRegistry,
@@ -125,8 +128,9 @@ class Platform:
         self.signals = SignalController(store)
         self.faults = FaultRegistry(store)
         self.armers = InterlockArmer(store)
-        self.mappings = MappingRegistry(store)
+        self.mappings = MappingRegistry(store, self.audit, self.clock)
         self.gaps = GapRegistry(store)
+        self.work_gaps = WorkGapRegistry(store)
         self.quotas = QuotaRegistry(store)
         self.commands = CommandLog(store)
         self.doors = DoorController(
@@ -137,6 +141,7 @@ class Platform:
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
+        self._station_locks: dict[str, FileLock] = {}
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
         self._seed(store)
@@ -189,7 +194,12 @@ class Platform:
                 for index, group in enumerate(groups, start=1)
             ]
             self.layouts.save(Layout(station_id=station_id, zones=zones))
-            self.mappings.renumber(station_id, {group: group for group in groups})
+            self.mappings.bootstrap_initial(
+                station_id,
+                {group: group for group in groups},
+                at=0.0,
+                submitted_by="installer",
+            )
             self.schedules.save(
                 Schedule(station_id=station_id, headways=[120, 150, 180, 240])
             )
@@ -220,6 +230,7 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        self._reconcile_mappings()
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -233,6 +244,37 @@ class Platform:
                 "line": self.namespace.line_id(),
             },
         )
+
+    def _station_lock(self, station_id: str) -> FileLock:
+        """返回某站台的跨进程关键区段锁。"""
+
+        if station_id not in self._station_locks:
+            self._station_locks[station_id] = FileLock(self.store.root, f"station-{station_id}")
+        return self._station_locks[station_id]
+
+    @contextmanager
+    def _station_guard(self, station_id: str):
+        """串行化同一站台到发、清扫与映射生效边界。"""
+
+        if not station_id:
+            raise RailError("站台标识为空", component="platform")
+        with self._station_lock(station_id).locked():
+            yield
+
+    def _reconcile_mappings(self) -> None:
+        """把旧版当前映射补登记为安装基线，并重放未完成投影。"""
+
+        for station_id in self.namespace.station_ids():
+            if self.mappings.history(station_id).revisions:
+                continue
+            mapping = self.mappings.current(station_id)
+            if mapping is not None:
+                self.mappings.bootstrap_initial(
+                    station_id,
+                    mapping.groups,
+                    at=0.0,
+                    submitted_by="migration",
+                )
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写事件，并记一条汇总审计。"""
@@ -347,7 +389,7 @@ class Platform:
     # ---- 到发编排 -----------------------------------------------------
 
     def arrive(self, train_id: str, station_id: str, position_m: int) -> dict:
-        """到站到开门：信号到站 → 停稳对位 → 对位落盘 → 开门。"""
+        """到站到开门：进入作业 → 信号到站 → 对位落盘 → 开门。"""
 
         op_id = self.ids.labeled("arrive")
         steps: list[dict] = []
@@ -384,36 +426,78 @@ class Platform:
         if self.stations.get(station_id) is None:
             return reject(f"站台未登记: {station_id}")
 
-        self.signals.raise_signal(train_id, ARRIVAL, self.clock.now())
-        steps.append(
-            {"component": "sig", "action": "arrival_signal", "detail": {"train_id": train_id}}
-        )
-        if self.trains.get(train_id) is None:
-            self.trains.upsert(Train(id=train_id, line=self.namespace.line_id()))
-        self.trains.assign_station(train_id, station_id)
+        with self._station_guard(station_id):
+            previous_gap = self.work_gaps.get(station_id)
+            try:
+                work_gap = self.work_gaps.enter(station_id, train_id, self.clock.now())
+            except RailError as error:
+                return reject(error.message)
+            if previous_gap.state == "occupied" and previous_gap.train_id == train_id:
+                return {
+                    "ok": True,
+                    "train_id": train_id,
+                    "station_id": station_id,
+                    "position_m": self.align.get(train_id).position_m
+                    if self.align.get(train_id)
+                    else 0,
+                    "service_seq": previous_gap.service_seq,
+                    "steps": [],
+                    "violations": [],
+                    "idempotent": True,
+                }
+            service_seq = work_gap.service_seq
+            try:
+                self.signals.raise_signal(train_id, ARRIVAL, self.clock.now())
+                steps.append(
+                    {"component": "sig", "action": "arrival_signal", "detail": {"train_id": train_id}}
+                )
+                if self.trains.get(train_id) is None:
+                    self.trains.upsert(Train(id=train_id, line=self.namespace.line_id()))
+                self.trains.assign_station(train_id, station_id)
+                self._reset_train_service(train_id, station_id)
 
-        stop_position = self._stop_position(station_id)
-        try:
-            alignment = self.align.align(train_id, position_m, stop_position, self.clock.now())
-        except RailError as error:
-            return reject(error.message)
-        steps.append(
-            {
-                "component": "train",
-                "action": "align",
-                "detail": {"train_id": train_id, "position_m": alignment.position_m},
-            }
+                stop_position = self._stop_position(station_id)
+                try:
+                    alignment = self.align.align(
+                        train_id, position_m, stop_position, self.clock.now()
+                    )
+                except RailError as error:
+                    self.work_gaps.force_state(previous_gap)
+                    return reject(error.message)
+                steps.append(
+                    {
+                        "component": "train",
+                        "action": "align",
+                        "detail": {"train_id": train_id, "position_m": alignment.position_m},
+                    }
+                )
+                try:
+                    opened_report = self.doors_open(train_id, station_id, service_seq)
+                except RailError as error:
+                    self._reset_train_service(train_id, station_id)
+                    self.work_gaps.force_state(previous_gap)
+                    return reject(error.message)
+            except Exception:
+                self.work_gaps.force_state(previous_gap)
+                raise
+        entry = self.audit.record(
+            ARRIVAL,
+            train_id,
+            station_id,
+            position_m=position_m,
+            service_seq=service_seq,
+            mapping_revision=int(opened_report.get("mapping_revision", 0)),
+            mapping_hash=str(opened_report.get("mapping_hash", "")),
+            gap_epoch=work_gap.epoch,
         )
-        try:
-            self.doors_open(train_id, station_id)
-        except RailError as error:
-            return reject(error.message)
-        entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
         report = {
             "ok": True,
             "train_id": train_id,
             "station_id": station_id,
             "position_m": alignment.position_m,
+            "service_seq": service_seq,
+            "mapping_revision": int(opened_report.get("mapping_revision", 0)),
+            "mapping_hash": str(opened_report.get("mapping_hash", "")),
             "steps": steps,
             "violations": [],
         }
@@ -422,14 +506,41 @@ class Platform:
         self._persist()
         return {**report, **summary, "arrival_audit": entry.id}
 
-    def doors_open(self, train_id: str, station_id: str) -> dict:
+    def doors_open(self, train_id: str, station_id: str, service_seq: int = 0) -> dict:
         """开门并确认车门：对位必须先落盘。"""
 
-        report = open_doors(self.doors, train_id, self.clock.now())
+        report = open_doors(
+            self.doors,
+            train_id,
+            self.clock.now(),
+            station_id=station_id,
+            service_seq=service_seq,
+        )
         group = self._primary_group(station_id)
+        linked: dict = {}
         if group:
-            open_group(self.doors, self.mappings, station_id, group)
+            command_id = f"arrive:{station_id}:{train_id}:{service_seq}"
+            resolved_group = self.mappings.resolve(station_id, group)
+            before = {
+                gate.id: gate.open
+                for gate in self.gates.by_station(station_id)
+                if gate.group == resolved_group
+            }
+            try:
+                linked = open_group(
+                    self.doors, self.mappings, station_id, group, command_id=command_id
+                )
+            except Exception:
+                # 门区联动若部分完成，必须恢复执行前的开闭状态，避免失败请求产生开门副作用。
+                for gate_id, was_open in before.items():
+                    gate = self.gates.get(gate_id)
+                    if gate is not None and gate.open != was_open:
+                        self.gates.set_open(gate_id, was_open)
+                self.store.remove(f"door/{station_id}/active_group")
+                raise
         self.train_doors.confirm_open(train_id, self.clock.now())
+        mapping_revision = int(linked.get("revision", 0)) if linked else 0
+        mapping_hash = str(linked.get("content_hash", "")) if linked else ""
         self.bus.publish(
             Event.of(
                 "door",
@@ -439,15 +550,37 @@ class Platform:
                 station_id=station_id,
                 severity="notice",
                 group=group,
+                service_seq=service_seq,
+                mapping_revision=mapping_revision,
+                mapping_hash=mapping_hash,
             )
         )
-        return {**report, "group": group}
+        return {
+            **report,
+            "group": group,
+            "mapping_revision": mapping_revision,
+            "mapping_hash": mapping_hash,
+        }
 
     def depart(self, train_id: str, station_id: str) -> dict:
-        """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
+        """关门到发车：关门 → 间隙确认 → 发车 → 清扫并开放下一间隙。"""
 
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
+
+        def fail(reason: str, locked_gate_id: str = "") -> dict:
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": [reason],
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            if locked_gate_id and self.lockouts.is_locked(locked_gate_id):
+                self.lockouts.clear(locked_gate_id)
+            return {**report, **summary}
+
         if not self.quotas.consume(DEPART):
             report = {
                 "ok": False,
@@ -459,54 +592,55 @@ class Platform:
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
 
-        gate = self._primary_gate(station_id)
-        if gate is not None and not self.lockouts.is_locked(gate.id):
-            self.lockouts.set(gate.id, True)
+        with self._station_guard(station_id):
+            service_seq = self.work_gaps.active_service(station_id, train_id)
+            if service_seq is None:
+                return fail("列车不在该站台的当前作业中")
+            gate = self._primary_gate(station_id)
+            locked_gate_id = ""
+            if gate is not None and not self.lockouts.is_locked(gate.id):
+                self.lockouts.set(gate.id, True)
+                locked_gate_id = gate.id
+                steps.append(
+                    {"component": "interlock", "action": "lock", "detail": {"psd_id": gate.id}}
+                )
+            try:
+                closed = close_and_audit(
+                    self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
+                )
+            except RailError as error:
+                return fail(error.message, locked_gate_id)
             steps.append(
-                {"component": "interlock", "action": "lock", "detail": {"psd_id": gate.id}}
+                {"component": "door", "action": "close_durable", "detail": {"train_id": train_id}}
             )
-        try:
-            closed = close_and_audit(
-                self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
+            gap_state = self.gaps.state(train_id)
+            steps.append(
+                {
+                    "component": "gap",
+                    "action": "check",
+                    "detail": {"train_id": train_id, "state": gap_state},
+                }
             )
-        except RailError as error:
-            report = {
-                "ok": False,
-                "train_id": train_id,
-                "station_id": station_id,
-                "steps": steps,
-                "violations": [error.message],
-            }
-            summary = self._record_operation(op_id, "depart", report)
-            return {**report, **summary}
-        steps.append(
-            {"component": "door", "action": "close_durable", "detail": {"train_id": train_id}}
-        )
-        gap_state = self.gaps.state(train_id)
-        steps.append(
-            {
-                "component": "gap",
-                "action": "check",
-                "detail": {"train_id": train_id, "state": gap_state},
-            }
-        )
-        verdict = depart_checked(self.signals, self.store, self.gaps, train_id, self.clock.now())
-        if not verdict["ok"]:
-            report = {
-                "ok": False,
-                "train_id": train_id,
-                "station_id": station_id,
-                "steps": steps,
-                "violations": list(verdict["violations"]),
-            }
-            summary = self._record_operation(op_id, "depart", report)
-            return {**report, **summary}
-        steps.append(
-            {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
-        )
-        departure = depart(self.doors, train_id, self.clock.now())
-        if gate is not None:
-            self.lockouts.clear(gate.id)
+            verdict = depart_checked(self.signals, self.store, self.gaps, train_id, self.clock.now())
+            if not verdict["ok"]:
+                return fail("; ".join(verdict["violations"]), locked_gate_id)
+            steps.append(
+                {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
+            )
+            departure = depart(self.doors, train_id, self.clock.now())
+            if gate is not None:
+                self.lockouts.clear(gate.id)
+                locked_gate_id = ""
+            swept = sweep_station(self.gates, station_id)
+            work_gap = self.work_gaps.exit(station_id, train_id, self.clock.now())
+            steps.append(
+                {
+                    "component": "psd",
+                    "action": "sweep",
+                    "detail": {"station_id": station_id, "closed": swept["closed"]},
+                }
+            )
+            activated = self.apply_ready_mappings(station_id)
         report = {
             "ok": True,
             "train_id": train_id,
@@ -514,6 +648,9 @@ class Platform:
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
             "cleared_commands": departure["cleared_commands"],
+            "swept": swept["closed"],
+            "gap_epoch": work_gap.epoch,
+            "activated_mapping": activated,
             "steps": steps,
             "violations": [],
         }
@@ -532,19 +669,183 @@ class Platform:
         self.audit.record("gap_probe", train_id, "", clear=clear)
         return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
 
-    def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
-        """按最新布局重排门区映射，并按新映射联动一次。"""
+    def mark_work_gap(self, station_id: str, actor: str) -> dict:
+        """由现场登记一次安全间隙边界，用于首车前的维护切换。"""
 
-        mapping = self.mappings.renumber(station_id, groups)
-        first_key = sorted(groups)[0]
-        linked = open_group(self.doors, self.mappings, station_id, first_key)
-        self.audit.record("mapping_renumber", "", station_id, revision=mapping.revision)
+        self._require_station(station_id)
+        with self._station_guard(station_id):
+            gap = self.work_gaps.mark_clear(station_id, self.clock.now())
+            activated = self.apply_ready_mappings(station_id)
+            self.audit.record(
+                "work_gap_marked",
+                "",
+                station_id,
+                actor=actor,
+                gap_epoch=gap.epoch,
+                activated=bool(activated),
+            )
         return {
             "ok": True,
             "station_id": station_id,
-            "revision": mapping.revision,
-            "mapping": mapping.as_dict(),
-            "active_group": linked["group"],
+            "work_gap": self.work_gaps.status(station_id),
+            "activated_mapping": activated,
+            "violations": [],
+        }
+
+    def submit_mapping(
+        self,
+        station_id: str,
+        groups: dict[str, str],
+        submitted_by: str,
+        base_revision: int | None = None,
+    ) -> dict:
+        """提交改图单；候选映射不会影响当前开门。"""
+
+        self._require_station(station_id)
+        self._validate_mapping_groups(station_id, groups)
+        proposal = self.mappings.propose(
+            station_id,
+            groups,
+            submitted_by=submitted_by,
+            at=self.clock.now(),
+            base_revision=base_revision,
+        )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "proposal": proposal.as_dict(),
+            "active_revision": self.mappings.revision(station_id),
+            "violations": [],
+        }
+
+    def approve_mapping(self, station_id: str, revision: int, approver: str) -> dict:
+        """追加一次双人确认；第二次确认记录批准时的作业间隙。"""
+
+        self._require_station(station_id)
+        with self._station_guard(station_id):
+            ready_epoch = self.work_gaps.clear_epoch(station_id)
+            if ready_epoch is None:
+                raise RailError("站台正在作业，不能在此间隙完成第二次确认", component="gap")
+            proposal = self.mappings.approve(
+                station_id,
+                revision,
+                approver=approver,
+                at=self.clock.now(),
+                ready_after_epoch=ready_epoch,
+            )
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "proposal": proposal.as_dict(),
+            "work_gap": self.work_gaps.status(station_id),
+            "violations": [],
+        }
+
+    def withdraw_mapping(self, station_id: str, revision: int, actor: str, reason: str = "") -> dict:
+        """生效前撤回候选；当前旧版本继续可用。"""
+
+        self._require_station(station_id)
+        with self._station_guard(station_id):
+            proposal = self.mappings.withdraw(
+                station_id, revision, actor=actor, at=self.clock.now(), reason=reason
+            )
+        return {"ok": True, "station_id": station_id, "proposal": proposal.as_dict(), "violations": []}
+
+    def apply_ready_mappings(self, station_id: str) -> dict | None:
+        """若已到批准后的下一个安全间隙，则激活待生效映射。"""
+
+        pending = self.mappings.pending(station_id)
+        if pending is None or pending.status != "approved":
+            return None
+        gap = self.work_gaps.get(station_id)
+        if gap.state != "clear" or pending.ready_after_epoch is None:
+            return None
+        if gap.epoch <= pending.ready_after_epoch:
+            return None
+        mapping = self.mappings.activate(
+            station_id, pending.revision, gap.epoch, at=self.clock.now()
+        )
+        return mapping.as_dict()
+
+    def activate_ready_mappings(self, station_id: str) -> dict:
+        """控制台/周期显式触发一次安全间隙生效检查。"""
+
+        self._require_station(station_id)
+        with self._station_guard(station_id):
+            activated = self.apply_ready_mappings(station_id)
+            pending = self.mappings.pending(station_id)
+        return {
+            "ok": activated is not None,
+            "station_id": station_id,
+            "activated": activated,
+            "pending": pending.as_dict() if pending else None,
+            "work_gap": self.work_gaps.status(station_id),
+            "violations": [],
+        }
+
+    def rollback_mapping(
+        self,
+        station_id: str,
+        target_revision: int,
+        submitted_by: str,
+        approver_one: str,
+        approver_two: str,
+    ) -> dict:
+        """把旧版本作为一张新的回滚候选提交并双人确认。"""
+
+        record = self.mappings.revision_record(station_id, target_revision)
+        actors = {submitted_by, approver_one, approver_two}
+        if len(actors) != 3:
+            raise MappingError("回滚提交人与两名确认人必须互不相同", component="platform")
+        if record.revision == self.mappings.revision(station_id):
+            raise MappingError("目标版本已经是当前生效版本", component="platform")
+        submit = self.submit_mapping(
+            station_id,
+            dict(record.groups),
+            submitted_by=submitted_by,
+            base_revision=self.mappings.revision(station_id),
+        )
+        proposal_id = int(submit["proposal"]["revision"])
+        self.mappings.approve(
+            station_id, proposal_id, approver=approver_one, at=self.clock.now()
+        )
+        second = self.approve_mapping(station_id, proposal_id, approver_two)
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "rollback_from": target_revision,
+            "proposal": second["proposal"],
+            "violations": [],
+        }
+
+    def mapping_workflow(self, station_id: str) -> dict:
+        """返回当前版本、候选单、历史版本和作业间隙。"""
+
+        self._require_station(station_id)
+        mapping = self.mappings.current(station_id)
+        pending = self.mappings.pending(station_id)
+        return {
+            "station_id": station_id,
+            "active": mapping.as_dict() if mapping else None,
+            "pending": pending.as_dict() if pending else None,
+            "revisions": [item.as_dict() for item in self.mappings.list_revisions(station_id)],
+            "work_gap": self.work_gaps.status(station_id),
+        }
+
+    def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
+        """兼容旧演示接口：提交并由两个检修账号确认，仍等待下一作业间隙。"""
+
+        proposal = self.submit_mapping(station_id, groups, submitted_by="legacy-operator")
+        revision = int(proposal["proposal"]["revision"])
+        self.mappings.approve(station_id, revision, approver="legacy-reviewer-a")
+        approved = self.approve_mapping(station_id, revision, "legacy-reviewer-b")
+        return {
+            "ok": True,
+            "station_id": station_id,
+            "revision": revision,
+            "mapping": approved["proposal"]["groups"],
+            "active_group": "",
+            "proposal": approved["proposal"],
             "violations": [],
         }
 
@@ -648,9 +949,18 @@ class Platform:
         }
 
     def sweep(self, station_id: str) -> dict:
-        """整站清扫。"""
+        """整站清扫；若用于修复失败发车，成功后关闭该作业间隙。"""
 
-        return sweep_station(self.gates, station_id)
+        self._require_station(station_id)
+        with self._station_guard(station_id):
+            outcome = sweep_station(self.gates, station_id)
+            gap = self.work_gaps.get(station_id)
+            if gap.state == "occupied" and departed(self.doors, gap.train_id):
+                work_gap = self.work_gaps.exit(station_id, gap.train_id, self.clock.now())
+                activated = self.apply_ready_mappings(station_id)
+                outcome["closed_gap_epoch"] = work_gap.epoch
+                outcome["activated_mapping"] = activated
+        return outcome
 
     def register_dwell(self, train_id: str, seconds: float, station_id: str = "") -> dict:
         """登记停站时长。"""
@@ -687,6 +997,12 @@ class Platform:
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
+        activated: list[dict] = []
+        for station_id in self.namespace.station_ids():
+            with self._station_lock(station_id).locked():
+                mapping = self.apply_ready_mappings(station_id)
+            if mapping is not None:
+                activated.append(mapping)
         self._persist()
         return {
             "ok": True,
@@ -697,6 +1013,7 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "activated_mappings": activated,
             "violations": [],
         }
 
@@ -742,6 +1059,7 @@ class Platform:
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
             ),
             "gaps": gap_summary(self.gaps, ids),
+            "work_gaps": [self.work_gaps.status(station_id) for station_id in self.namespace.station_ids()],
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
@@ -767,8 +1085,15 @@ class Platform:
             },
             "mapping_revisions": {
                 station_id: {
-                    "latest": self.mappings.history(station_id).latest(),
+                    "active": self.mappings.revision(station_id),
+                    "latest_candidate": self.mappings.history(station_id).latest(),
                     "log": self.mappings.history(station_id).as_dict()["revisions"],
+                    "pending": (
+                        self.mappings.pending(station_id).as_dict()
+                        if self.mappings.pending(station_id)
+                        else None
+                    ),
+                    "work_gap": self.work_gaps.status(station_id),
                 }
                 for station_id in self.namespace.station_ids()
             },
@@ -807,6 +1132,10 @@ class Platform:
             "revision": mapping.revision if mapping else 0,
             "groups": group_keys(self.mappings, station_id),
             "active_group": active_group(self.doors, station_id),
+            "pending_mapping": self.mappings.pending(station_id).as_dict()
+            if self.mappings.pending(station_id)
+            else None,
+            "work_gap": self.work_gaps.status(station_id),
             "pressure": open_pressure(self.doors, station_id),
         }
 
@@ -843,9 +1172,47 @@ class Platform:
 
     # ---- 内部 ---------------------------------------------------------
 
+    def _reset_train_service(self, train_id: str, station_id: str = "") -> None:
+        """进入新车-站作业前清掉上一轮的门控、对位和间隙事实。"""
+
+        for doc_id in (
+            f"door/{train_id}/open",
+            f"door/{train_id}/close",
+            f"door/{train_id}/departed",
+            f"train/{train_id}/align",
+            f"train/{train_id}/door",
+            f"gap/{train_id}",
+        ):
+            self.store.remove(doc_id)
+        if station_id:
+            self.store.remove(f"door/{station_id}/active_group")
+        self.commands.clear(train_id)
+
+    def _require_station(self, station_id: str) -> None:
+        self.namespace.require(station_id)
+        if self.stations.get(station_id) is None:
+            raise RailError(f"站台未登记: {station_id}", component="console")
+
+    def _validate_mapping_groups(self, station_id: str, groups: dict[str, str]) -> None:
+        """提交前验证映射能覆盖逻辑门区并解析到本站现存物理门区。"""
+
+        if not isinstance(groups, dict) or not groups:
+            raise MappingError("映射必须是非空对象", component="platform")
+        current = self.mappings.current(station_id)
+        if current is None:
+            raise MappingError(f"站台 {station_id} 没有映射基线", component="platform")
+        clean = {str(key): str(value) for key, value in groups.items()}
+        if any(not key or not value for key, value in clean.items()):
+            raise MappingError("逻辑门区或物理门区不能为空", component="platform")
+        physical = {gate.group for gate in self.gates.by_station(station_id)}
+        missing = sorted({value for value in clean.values() if value not in physical})
+        if missing:
+            raise MappingError(
+                f"物理门区在站台 {station_id} 不存在: {','.join(missing)}", component="platform"
+            )
+
     def _stop_position(self, station_id: str) -> int:
         """返回站台的停稳位置（取最近门区里程）。"""
-
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
         nearest = nearest_zone(zones)

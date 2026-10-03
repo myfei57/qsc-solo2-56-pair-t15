@@ -72,13 +72,20 @@ class Api:
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
         add("GET", "/api/mapping/{stationID}", self._mapping)
+        add("GET", "/api/mapping/{stationID}/workflow", self._mapping_workflow)
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
+        add("POST", "/api/work-gap", self._work_gap)
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
+        add("POST", "/api/mapping/propose", self._mapping_propose)
+        add("POST", "/api/mapping/approve", self._mapping_approve)
+        add("POST", "/api/mapping/withdraw", self._mapping_withdraw)
+        add("POST", "/api/mapping/apply", self._mapping_apply)
+        add("POST", "/api/mapping/rollback", self._mapping_rollback)
         add("POST", "/api/renumber", self._renumber)
         add("POST", "/api/batch-open", self._batch_open)
         add("POST", "/api/fault", self._fault)
@@ -170,6 +177,48 @@ class Api:
             raise RailError(f"站台 {station_id} 没有门区映射", component="console")
         return mapping.as_dict()
 
+    def _mapping_workflow(self, params: dict, body: dict) -> dict:
+        return self._platform.mapping_workflow(str(params.get("stationID", "")))
+
+    def _mapping_propose(self, params: dict, body: dict) -> dict:
+        groups = body.get("groups")
+        if not isinstance(groups, dict) or not groups:
+            raise RailError("映射必须是非空对象", component="console")
+        base_revision = body.get("base_revision")
+        return self._platform.submit_mapping(
+            _require(body, "station_id"),
+            {str(key): str(value) for key, value in groups.items()},
+            _require(body, "submitted_by"),
+            None if base_revision is None else int(base_revision),
+        )
+
+    def _mapping_approve(self, params: dict, body: dict) -> dict:
+        return self._platform.approve_mapping(
+            _require(body, "station_id"),
+            _as_int(body, "revision", 0),
+            _require(body, "approver"),
+        )
+
+    def _mapping_withdraw(self, params: dict, body: dict) -> dict:
+        return self._platform.withdraw_mapping(
+            _require(body, "station_id"),
+            _as_int(body, "revision", 0),
+            _require(body, "actor"),
+            str(body.get("reason", "")),
+        )
+
+    def _mapping_apply(self, params: dict, body: dict) -> dict:
+        return self._platform.activate_ready_mappings(_require(body, "station_id"))
+
+    def _mapping_rollback(self, params: dict, body: dict) -> dict:
+        return self._platform.rollback_mapping(
+            _require(body, "station_id"),
+            _as_int(body, "target_revision", 0),
+            _require(body, "submitted_by"),
+            _require(body, "approver_one"),
+            _require(body, "approver_two"),
+        )
+
     def _resolve(self, params: dict, body: dict) -> dict:
         return self._platform.resolve_group(
             str(params.get("station_id", "")), str(params.get("group_key", ""))
@@ -199,6 +248,11 @@ class Api:
 
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
+
+    def _work_gap(self, params: dict, body: dict) -> dict:
+        return self._platform.mark_work_gap(
+            _require(body, "station_id"), _require(body, "actor")
+        )
 
     def _enqueue(self, params: dict, body: dict) -> dict:
         return self._platform.enqueue(

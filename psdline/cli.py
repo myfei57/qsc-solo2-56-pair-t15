@@ -70,6 +70,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     platform = build_platform(config, clock=clock, storage_root=storage_root)
 
     startup = platform.start()
+    renumber = platform.renumber(args.station, _mirror_mapping(platform, args.station))
     arrival = platform.arrive(args.train, args.station, 0)
     position = platform.refresh_position(args.train, 12)
     gap = platform.check_gap(args.train)
@@ -79,7 +80,6 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     fault = platform.set_fault(_first_gate(platform, args.station))
     cleared = platform.clear_fault(_first_gate(platform, args.station))
     batched = platform.batch_open(args.station)
-    renumber = platform.renumber(args.station, _mirror_mapping(platform, args.station))
     sequence = platform.sequence_verdict(65534, 4)
     dwell = platform.register_dwell(args.train, 45.0, args.station)
     route = platform.assign_route(args.train, args.station, _next_station(platform, args.station), 1200)

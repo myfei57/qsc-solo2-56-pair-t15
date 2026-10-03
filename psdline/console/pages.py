@@ -56,14 +56,14 @@ def _shell(title: str, body: str) -> str:
 
 
 def _station_page(platform: Platform) -> str:
-    """站台页：门区、布局与映射修订。"""
+    """站台页：门区、布局、待生效映射与作业间隙。"""
 
     status = platform.status()
     rows: list[tuple[str, object]] = [
         ("线路", status["line"]),
         ("站台数", len(status["stations"])),
         ("门区总数", sum(len(item["door_groups"]) for item in status["stations"])),
-        ("映射重排次数", platform.mappings.rewrites),
+        ("映射激活次数", platform.mappings.rewrites),
     ]
     body = _table("线路概览", rows)
     body += _table(
@@ -77,7 +77,15 @@ def _station_page(platform: Platform) -> str:
     views = [platform.station_view(item["id"]) for item in status["stations"]]
     body += _table(
         "布局与映射",
-        [(item["station"]["id"], f"修订 {item['revision']} 跨度 {item['span_m']} m") for item in views]
+        [
+            (
+                item["station"]["id"],
+                f"修订 {item['revision']} 跨度 {item['span_m']} m "
+                f"间隙 {item['work_gap']['state']}#{item['work_gap']['epoch']} "
+                f"待生效 {item['pending_mapping']['revision'] if item['pending_mapping'] else '-'}",
+            )
+            for item in views
+        ]
         or [("暂无", "-")],
     )
     return _shell("站台控制台", body)

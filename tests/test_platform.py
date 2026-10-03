@@ -1,8 +1,10 @@
-"""平台级到发链路与状态快照。"""
+"""平台级到发链路与门区映射修订流程。"""
 
 from __future__ import annotations
 
-from psdline.errors import RailError
+import pytest
+
+from psdline.errors import MappingError, RailError
 from psdline.door import departed
 
 
@@ -27,6 +29,7 @@ def test_arrive_then_depart_full_chain(platform):
     assert departure["close_durable"] is True
     assert departure["aspect"] == "green"
     assert departed(platform.doors, "T01") is True
+    assert platform.gates.count_open() == 0
 
 
 def test_arrive_rejects_out_of_tolerance_and_unknown_station(platform):
@@ -38,21 +41,80 @@ def test_arrive_rejects_out_of_tolerance_and_unknown_station(platform):
     assert unknown["ok"] is False
 
 
-def test_depart_blocked_by_blocked_gap(platform):
+def test_mapping_requires_two_approvals_and_next_gap(platform):
+    submit = platform.submit_mapping("ST1", {"A": "G02"}, submitted_by="op1")
+    revision = submit["proposal"]["revision"]
+    assert revision == 2
+    assert platform.mappings.revision("ST1") == 1
+
+    first = platform.approve_mapping("ST1", revision, "reviewer-a")
+    assert first["proposal"]["status"] == "partially_approved"
+    with pytest.raises(MappingError):
+        platform.approve_mapping("ST1", revision, "op1")
+
+    second = platform.approve_mapping("ST1", revision, "reviewer-b")
+    assert second["proposal"]["status"] == "approved"
+    assert platform.mappings.revision("ST1") == 1
+
     platform.arrive("T01", "ST1", 0)
-    platform.check_gap("T01", clear=False)
+    occupied = platform.activate_ready_mappings("ST1")
+    assert occupied["ok"] is False and occupied["activated"] is None
+    platform.check_gap("T01")
     departure = platform.depart("T01", "ST1")
-    assert departure["ok"] is False
-    assert "间隙探测未确认" in departure["violations"]
-
-
-def test_renumber_links_new_group(platform):
-    result = platform.renumber("ST1", {"A": "G02", "B": "G03"})
-    assert result["ok"] is True
-    assert result["revision"] == 2
-    assert result["active_group"] == "G02"
+    assert departure["activated_mapping"]["revision"] == 2
     assert platform.mappings.revision("ST1") == 2
-    assert platform.station_view("ST1")["active_group"] == "G02"
+
+
+def test_mapping_withdraw_keeps_old_version(platform):
+    revision = platform.submit_mapping("ST1", {"A": "G02"}, "op1")["proposal"]["revision"]
+    platform.approve_mapping("ST1", revision, "r1")
+    platform.approve_mapping("ST1", revision, "r2")
+    withdrawn = platform.withdraw_mapping("ST1", revision, "op2", "改错了")
+    assert withdrawn["proposal"]["status"] == "withdrawn"
+    assert platform.mappings.revision("ST1") == 1
+    assert platform.mappings.resolve("ST1", "G01") == "G01"
+    assert [item.revision for item in platform.mappings.list_revisions("ST1")] == [1, 2]
+
+
+def test_rollback_candidate_restores_old_groups_without_recomputing_doors(platform):
+    revision = platform.submit_mapping("ST1", {"A": "G02"}, "op1")["proposal"]["revision"]
+    platform.approve_mapping("ST1", revision, "r1")
+    platform.approve_mapping("ST1", revision, "r2")
+    platform.arrive("T01", "ST1", 0)
+    # 第一轮按旧映射打开 G01；激活后的撤回/回滚不反算这些门。
+    from psdline.door import active_group
+
+    assert active_group(platform.doors, "ST1") == "G01"
+    platform.check_gap("T01")
+    platform.depart("T01", "ST1")
+    assert platform.mappings.revision("ST1") == 2
+
+    rollback = platform.rollback_mapping("ST1", 1, "op2", "r3", "r4")
+    candidate = rollback["proposal"]["revision"]
+    assert candidate == 3
+    assert platform.mappings.revision("ST1") == 2
+
+    platform.arrive("T01", "ST1", 0)
+    # 已批准但需等批准后的下一个间隙；新一轮作业期间不能切入。
+    assert platform.mappings.revision("ST1") == 2
+    platform.check_gap("T01")
+    platform.depart("T01", "ST1")
+    assert platform.mappings.revision("ST1") == 3
+    assert platform.mappings.resolve("ST1", "G01") == "G01"
+
+
+def test_concurrent_mapping_submit_is_optimistically_rejected(platform):
+    platform.submit_mapping("ST1", {"A": "G02"}, "op1")
+    with pytest.raises(MappingError):
+        platform.submit_mapping("ST1", {"A": "G03"}, "op2")
+
+
+def test_repeated_arrival_is_idempotent_for_same_service(platform):
+    first = platform.arrive("T01", "ST1", 0)
+    second = platform.arrive("T01", "ST1", 0)
+    assert first["service_seq"] == 1
+    assert second["service_seq"] == 1
+    assert platform.doors.opens == 1
 
 
 def test_fault_locks_gate_and_clear_releases(platform):
@@ -128,6 +190,7 @@ def test_status_and_snapshot_cover_every_component(platform):
         "signals",
         "interlock",
         "gaps",
+        "work_gaps",
         "quota",
         "store",
         "audit",

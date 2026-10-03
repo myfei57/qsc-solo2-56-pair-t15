@@ -64,6 +64,30 @@ def test_api_mapping_and_resolve(platform):
     assert status == 409
 
 
+def test_api_mapping_workflow(platform):
+    api = Api(platform)
+
+    def call(path, payload):
+        return api.handle("POST", path, {}, payload)
+
+    status, proposed = call(
+        "/api/mapping/propose",
+        {"station_id": "ST1", "groups": {"A": "G02"}, "submitted_by": "op1"},
+    )
+    assert status == 200
+    revision = proposed["proposal"]["revision"]
+    assert call("/api/mapping/approve", {"station_id": "ST1", "revision": revision, "approver": "r1"})[0] == 200
+    assert call("/api/mapping/approve", {"station_id": "ST1", "revision": revision, "approver": "r2"})[0] == 200
+    status, workflow = api.handle("GET", "/api/mapping/ST1/workflow", {"stationID": "ST1"}, {})
+    assert status == 200
+    assert workflow["pending"]["revision"] == revision
+    status, withdrawn = call(
+        "/api/mapping/withdraw",
+        {"station_id": "ST1", "revision": revision, "actor": "op2", "reason": "撤回"},
+    )
+    assert status == 200 and withdrawn["proposal"]["status"] == "withdrawn"
+
+
 def test_api_action_flow(platform):
     api = Api(platform)
     status, arrival = api.handle(

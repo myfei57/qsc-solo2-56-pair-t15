@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 from ..clock import Clock
 from ..errors import RailError
@@ -21,6 +22,21 @@ class AuditLog:
         self._journal = journal
         self._ids = IdFactory("audit")
         self._index: list[AuditEntry] = []
+        self._event_ids: set[str] = set()
+        self._lock = threading.RLock()
+        self._load_journal()
+
+    def _load_journal(self) -> None:
+        """把已落盘审计装入内存并建立幂等键集合。"""
+
+        for item in self._journal.read_all():
+            if not isinstance(item, dict):
+                continue
+            entry = AuditEntry.from_dict(item)
+            self._index.append(entry)
+            event_id = entry.detail.get("event_id")
+            if isinstance(event_id, str) and event_id:
+                self._event_ids.add(event_id)
 
     @property
     def journal(self) -> JsonlJournal:
@@ -36,32 +52,45 @@ class AuditLog:
         train_id: str,
         station_id: str,
         at: float | None = None,
+        event_id: str | None = None,
+        publish: bool = True,
         **detail: object,
     ) -> AuditEntry:
-        """写入一条审计流水。"""
+        """写入一条审计流水；同一 ``event_id`` 重放时返回原条目。"""
 
         if not kind:
             raise RailError("审计动作类型为空", component="audit")
-        entry = AuditEntry(
-            id=self._ids.next(),
-            kind=kind,
-            train_id=train_id,
-            station_id=station_id,
-            at=self._clock.now() if at is None else at,
-            detail={key: value for key, value in detail.items() if value is not None},
-        )
-        self._journal.append(entry.as_dict())
-        self._index.append(entry)
-        self._bus.publish(
-            Event.of(
-                "audit",
-                "audit",
-                kind,
-                severity="notice",
+        clean_detail = {key: value for key, value in detail.items() if value is not None}
+        if event_id:
+            clean_detail["event_id"] = event_id
+        with self._lock:
+            if event_id:
+                for existing in reversed(self._index):
+                    if existing.detail.get("event_id") == event_id:
+                        return existing
+            entry = AuditEntry(
+                id=self._ids.next(),
+                kind=kind,
                 train_id=train_id,
                 station_id=station_id,
+                at=self._clock.now() if at is None else at,
+                detail=clean_detail,
             )
-        )
+            self._journal.append(entry.as_dict())
+            self._index.append(entry)
+            if event_id:
+                self._event_ids.add(event_id)
+        if publish:
+            self._bus.publish(
+                Event.of(
+                    "audit",
+                    "audit",
+                    kind,
+                    severity="notice",
+                    train_id=train_id,
+                    station_id=station_id,
+                )
+            )
         return entry
 
     def list(self) -> list[AuditEntry]:
